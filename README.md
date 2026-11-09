@@ -52,7 +52,20 @@ That's all you need to get started. By default, fast-rlm uses [OpenRouter](https
 
 ## Quick Start
 
-![Quickstart](docs/images/quickstart.jpeg)
+<!--![Quickstart](docs/images/quickstart.jpeg)-->
+
+```bash
+set -a; source .env; set +a
+uv run fast-rlm "Generate 50 fruits and count number of r"
+```
+
+```bash
+uv run fast-rlm-log logs/run_2026-11-09T06-39-16-626Z.jsonl --tui
+```
+
+```bash
+uv run fast-rlm --help
+```
 
 ```python
 import fast_rlm
