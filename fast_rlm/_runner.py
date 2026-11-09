@@ -1,0 +1,882 @@
+import inspect
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import textwrap
+import threading
+import time
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import yaml
+
+
+# Verbosity levels, shared with the Deno engine (--verbosity N):
+#   0 silent  — no terminal output at all
+#   1 summary — final result + global usage banners only
+#   2 full    — per-step boxes, spinners, chatter (default)
+_VERBOSITY_LEVELS = {"silent": 0, "quiet": 0, "summary": 1, "full": 2, "verbose": 2}
+
+
+def resolve_session_dir(
+    session_id: Optional[str], session_dir: Optional[str]
+) -> Optional[str]:
+    """Map (session_id, session_dir) to the directory that holds ``state.json``.
+
+    - both ``None``          -> ``None`` (no on-disk session)
+    - ``session_dir`` only   -> ``session_dir`` itself
+    - both set               -> ``<session_dir>/<session_id>``
+    - ``session_id`` only    -> ``ValueError`` (an id needs a dir to live in)
+    """
+    if session_id is not None and session_dir is None:
+        raise ValueError(
+            "session_id requires session_dir. Pass session_dir=... too, or omit "
+            "both for an ephemeral in-memory session."
+        )
+    if session_dir is None:
+        return None
+    return os.path.join(session_dir, session_id) if session_id is not None else session_dir
+
+
+def _normalize_verbosity(verbosity: Optional["int | str"], verbose: bool) -> int:
+    """Resolve the effective verbosity level (0-2).
+
+    `verbosity` wins when set (int 0-2 or a name in _VERBOSITY_LEVELS); otherwise
+    fall back to the legacy `verbose` bool (True -> full, False -> silent).
+    """
+    if verbosity is None:
+        return 2 if verbose else 0
+    if isinstance(verbosity, bool):  # bool is an int subclass — guard first
+        return 2 if verbosity else 0
+    if isinstance(verbosity, int):
+        if verbosity < 0 or verbosity > 2:
+            raise ValueError("verbosity int must be 0 (silent), 1 (summary), or 2 (full).")
+        return verbosity
+    if isinstance(verbosity, str):
+        key = verbosity.strip().lower()
+        if key not in _VERBOSITY_LEVELS:
+            raise ValueError(
+                f"verbosity string must be one of {sorted(set(_VERBOSITY_LEVELS))}, got {verbosity!r}."
+            )
+        return _VERBOSITY_LEVELS[key]
+    raise TypeError("verbosity must be None, an int (0-2), or a str.")
+
+
+def _tail_events(path: str, on_step: Callable[[dict], None], stop: threading.Event) -> None:
+    """Tail an NDJSON events file, invoking on_step for each complete line.
+
+    Runs in a daemon thread while the engine subprocess executes. The engine
+    writes each event synchronously (append + flush), so complete newline-
+    terminated lines are safe to parse as they appear. Returns only after the
+    file is fully drained *and* `stop` is set (i.e. the subprocess has exited),
+    so no trailing events are lost. A raising callback is caught and warned
+    about rather than allowed to kill the run.
+    """
+    buf = ""
+    f = None
+    try:
+        while True:
+            if f is None:
+                if os.path.exists(path):
+                    f = open(path, "r", encoding="utf-8", errors="replace")
+                elif stop.is_set():
+                    return  # subprocess ended without ever creating the file
+                else:
+                    time.sleep(0.05)
+                    continue
+            chunk = f.read()
+            if chunk:
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    try:
+                        on_step(event)
+                    except Exception as e:  # never let a user callback break the run
+                        warnings.warn(f"on_step callback raised {type(e).__name__}: {e}")
+            elif stop.is_set():
+                return  # drained everything and the subprocess is done
+            else:
+                time.sleep(0.05)
+    finally:
+        if f is not None:
+            f.close()
+
+
+_PRIMITIVE_JSON_SCHEMAS = {
+    str: {"type": "string"},
+    int: {"type": "integer"},
+    float: {"type": "number"},
+    bool: {"type": "boolean"},
+    list: {"type": "array"},
+    dict: {"type": "object"},
+}
+
+
+def _to_json_schema(schema: Any) -> dict:
+    """Convert a user-supplied output schema into a JSON Schema dict.
+
+    Accepts:
+      - dict: assumed to already be a JSON Schema, returned as-is.
+      - Python primitive type (str/int/float/bool/list/dict): mapped directly.
+      - Pydantic BaseModel subclass: uses model_json_schema().
+      - Any other type usable by pydantic.TypeAdapter (e.g. list[int]): uses TypeAdapter.
+    """
+    if isinstance(schema, dict):
+        return schema
+    if isinstance(schema, type) and schema in _PRIMITIVE_JSON_SCHEMAS:
+        return _PRIMITIVE_JSON_SCHEMAS[schema]
+    try:
+        from pydantic import BaseModel, TypeAdapter
+    except ImportError as e:
+        raise TypeError(
+            "output_schema must be a JSON Schema dict, a primitive type "
+            "(str/int/float/bool/list/dict), or a pydantic type. "
+            "Install pydantic to use Pydantic models or generic types."
+        ) from e
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        return schema.model_json_schema()
+    return TypeAdapter(schema).json_schema()
+
+
+@dataclass
+class RLMConfig:
+    """Configuration for fast-rlm."""
+
+    # primary_agent is REQUIRED — there is no default. run() raises if it is unset.
+    # sub_agent is optional; when unset it falls back to primary_agent.
+    primary_agent: Optional[str] = None
+    sub_agent: Optional[str] = None
+    max_depth: int = 3
+    max_calls_per_subagent: int = 20
+    # Chars of REPL stdout shown to the model per step. Quality-critical for
+    # document/navigation tasks: too low and the model only sees a truncated
+    # slice of gathered results (offsets, IDs, candidates) and is forced to guess
+    # the rest, hurting grounding/citation accuracy. Default raised from 2000 to
+    # 10000 after user reports; raise further for large-context extraction.
+    truncate_len: int = 10000
+    max_money_spent: float = 0.2
+    # Cumulative completion tokens across the whole run (output is generated once,
+    # never re-sent, so summing is correct).
+    max_completion_tokens: int = 50000
+    # PER-CALL ceiling on one LLM call's input + output tokens (NOT a run-wide
+    # sum). Bounds how large a single agent's context may grow; the run stops once
+    # any one call exceeds it. Checked against the usage that call returned, so
+    # it's approximate but needs no tokenizer.
+    max_prompt_tokens: int = 200000
+    # Global cap on the TOTAL number of LLM calls across the whole run (root +
+    # all sub-agents, every backend). None = unlimited. Once reached, no new
+    # calls are made and the run stops. The only budget that bites for ACP,
+    # where token/cost usage is always zero — set it for any ACP run.
+    max_global_calls: Optional[int] = None
+    api_max_retries: int = 3
+    api_timeout_ms: int = 600000
+    # Ablation toggles. When False, the capability is removed from the agent's
+    # REPL AND stripped from its system prompt (root + all sub-agents):
+    #   enable_tools           -> user-defined Python tools + llm_query(tools=...)
+    #   enable_structured_io   -> output_schema validation, llm_query(schema=...),
+    #                             and dict/list inputs (shown to the agent as str)
+    enable_tools: bool = True
+    enable_structured_io: bool = True
+    # Capability inheritance for sub-agents (default False — a sub-agent starts
+    # with nothing its parent did not explicitly hand it):
+    #   inherit_tools -> a child spawned without `tools=` gets its parent's
+    #                    Python tools, and passes them down in turn
+    #   inherit_mcp   -> a child spawned without `mcp=` gets every MCP server
+    #                    its parent can reach, and passes them down in turn
+    # An explicit argument on the llm_query call always wins, including an empty
+    # list, which grants nothing. Inheritance can only narrow with depth: a child
+    # never gains access its parent did not have. Turning inherit_mcp on means
+    # sub-agents at every depth can call the same MCP tools as the root, so only
+    # enable it when every configured server is safe for them to reach.
+    inherit_tools: bool = False
+    inherit_mcp: bool = False
+    # Compression guard: when an agent delegates a large, barely-compressed
+    # context to a subagent, make it self-confirm (same model, same system
+    # prompt) before the call runs; NO blocks and forces a compress + retry.
+    enable_compression_guard: bool = True
+    compression_min_chars: int = 5000
+    compression_ratio: float = 0.6
+    # ACP backdoor: register non-preset Agent Client Protocol agents by command,
+    # then select one via primary_agent/sub_agent="acp:<name>". Built-in presets
+    # (acp:claude-code, acp:codex, acp:opencode) need no entry here. Example:
+    #   acp_agents={"hermes": {"command": "hermes", "args": ["acp"]}}
+    # Each value: {command, args?, readonly_mode?, model?, env?}.
+    acp_agents: Optional[dict] = None
+    # CLI agents: drive a coding agent through its own non-interactive mode
+    # (`claude -p`, `codex exec`, `opencode run`) instead of over ACP, selected
+    # as primary_agent/sub_agent="cli:<name>". Built-in presets (cli:claude-code,
+    # cli:codex, cli:opencode) need no entry; register others, or override a
+    # preset by re-declaring its name — which is how a CLI flag change is
+    # repaired locally, with no fast-rlm release. Example:
+    #   cli_agents={"mycli": {"command": "mycli", "args": ["--json"],
+    #                         "extract": {"kind": "json", "path": "reply"}}}
+    cli_agents: Optional[dict] = None
+    # Opt into each CLI preset's extra "minimal" flags (claude's --bare: far
+    # cheaper per step, but that mode never reads the agent's interactive login,
+    # so it requires ANTHROPIC_API_KEY). Off by default so subscription logins
+    # keep working.
+    cli_minimal: bool = False
+    # Permit a CLI agent to run while an API key that would override its
+    # subscription login is set (see _check_cli_auth). Off by default so a
+    # stray ANTHROPIC_API_KEY cannot quietly meter a run that was meant to use
+    # your plan. Implied by cli_minimal, whose --bare mode needs the key.
+    cli_allow_api_key: bool = False
+
+    @classmethod
+    def default(cls) -> "RLMConfig":
+        """Load defaults from bundled rlm_config.yaml (resolving any profile)."""
+        try:
+            engine_dir = _find_engine_dir()
+            config_path = engine_dir / "rlm_config.yaml"
+            with open(config_path) as f:
+                data = _apply_profile(yaml.safe_load(f) or {})
+            return cls(
+                **{k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+            )
+        except (OSError, yaml.YAMLError):
+            return cls()
+
+
+def _find_engine_dir() -> Path:
+    """Find the TS engine: bundled (_engine/) for pip install, project root for dev."""
+    bundled = Path(__file__).parent / "_engine"
+    if (bundled / "deno.json").exists():
+        return bundled
+
+    # Editable / dev install: walk up to project root
+    root = Path(__file__).resolve().parent.parent
+    if (root / "deno.json").exists():
+        return root
+
+    raise FileNotFoundError(
+        "Cannot find the fast-rlm TS engine. "
+        "Ensure the package is installed correctly or you're in the project root."
+    )
+
+
+_PROFILE_ENV = "RLM_PROFILE"
+
+
+def _apply_profile(data: dict) -> dict:
+    """Resolve the optional ``profile``/``profiles`` presets in rlm_config.yaml.
+
+    Top-level keys are the shared base and the selected profile's keys override
+    them. Selection order: the ``RLM_PROFILE`` env var, then the top-level
+    ``profile`` key. With no profiles configured the data is returned unchanged
+    (minus the preset machinery), so plain configs keep working.
+    """
+    if not isinstance(data, dict):
+        return {}
+    base = {k: v for k, v in data.items() if k not in ("profile", "profiles")}
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        return base
+    name = os.environ.get(_PROFILE_ENV) or data.get("profile")
+    if not name:
+        return base
+    if name not in profiles:
+        available = ", ".join(sorted(str(p) for p in profiles))
+        raise ValueError(
+            f"Unknown rlm_config profile {name!r}. Available profiles: {available}. "
+            f"Set `profile:` in rlm_config.yaml or {_PROFILE_ENV}."
+        )
+    selected = profiles.get(name)
+    if not isinstance(selected, dict):
+        raise ValueError(f"Profile {name!r} must be a mapping of config keys.")
+    return {**base, **selected}
+
+
+# Built-in cli: preset -> binary. Mirrors PRESETS in src/cli_agent.ts; used only
+# to scope --allow-run, so an unknown name simply falls back to a broad grant.
+_CLI_PRESET_BINARIES = {
+    "claude-code": "claude",
+    "codex": "codex",
+    "opencode": "opencode",
+}
+
+# Env vars that make a preset bill the wrong account. Mirrors `forbid_env` in
+# src/cli_agent.ts; checked here too so the run dies in Python before anything
+# is spawned, rather than one subprocess deeper.
+_CLI_PRESET_FORBIDDEN_ENV = {
+    "claude-code": ["ANTHROPIC_API_KEY"],
+}
+
+# Presets that take a model flag, and therefore require an explicit model.
+# Mirrors `model_flag` in src/cli_agent.ts.
+_CLI_PRESETS_NEED_MODEL = {"claude-code", "codex", "opencode"}
+
+
+def _check_cli_model(agents: list[str], registry: Optional[dict]) -> None:
+    """Require an explicit model for every CLI agent that can take one.
+
+    Left unset, the model is whatever the vendor's CLI currently defaults to: it
+    changes between releases, it does not appear anywhere in the run's config,
+    and for Claude Code it is Opus — the most expensive option. fast-rlm does
+    not guess on the user's behalf.
+    """
+    from urllib.parse import parse_qs
+
+    registry = registry or {}
+    for agent in agents:
+        name, _, query = agent[4:].partition("?")
+        stated = bool(parse_qs(query).get("model", [""])[0])
+        spec = registry.get(name)
+        if isinstance(spec, dict):
+            takes_model = bool(spec.get("model_flag"))
+            stated = stated or bool(spec.get("model"))
+        else:
+            takes_model = name in _CLI_PRESETS_NEED_MODEL
+        if not takes_model or stated:
+            continue
+        raise RuntimeError(
+            f"{agent!r} does not specify a model, and fast-rlm does not pick one "
+            f"for you.\n\n"
+            f"  Left unset, the model is whatever the agent's CLI currently "
+            f"defaults to — it changes between releases, it is invisible in your "
+            f"run config, and for Claude Code it is Opus, the most expensive "
+            f"option.\n\n"
+            f'  Per run:      primary_agent="cli:{name}?model=<id>"\n'
+            f'  Per project:  set "model" on the agent\'s cli_agents entry\n\n'
+            f"  Aliases and exact ids both work; pin an exact id for anything you "
+            f"need to reproduce later."
+        )
+
+
+def _check_cli_auth(agents: list[str], registry: Optional[dict], allow_api_key: bool) -> None:
+    """Refuse to run a CLI agent that would silently bill an API key.
+
+    `claude` prefers ANTHROPIC_API_KEY over an interactive subscription login
+    with no error and no warning fast-rlm can surface, so a run that looks like
+    it is using your plan is metered instead. Fail loudly rather than quietly
+    spend money.
+    """
+    if allow_api_key:
+        return
+    registry = registry or {}
+    for agent in agents:
+        name = agent[4:].split("?", 1)[0]
+        spec = registry.get(name)
+        if isinstance(spec, dict):
+            forbidden = spec.get("forbid_env") or []
+        else:
+            forbidden = _CLI_PRESET_FORBIDDEN_ENV.get(name, [])
+        present = [k for k in forbidden if os.environ.get(k)]
+        if not present:
+            continue
+        joined = ", ".join(present)
+        raise RuntimeError(
+            f"{agent!r} refuses to run while {joined} is set.\n\n"
+            f"  The agent's CLI silently prefers that key over your subscription "
+            f"login, so this run would be billed per token instead of using your "
+            f"plan — with no warning.\n\n"
+            f"  Use your subscription:  unset {' '.join(present)}\n"
+            f"  Or accept API billing:  RLMConfig(cli_allow_api_key=True), or "
+            f"--cli-allow-api-key\n"
+            f"  cli_minimal implies it: that mode cannot read a subscription login."
+        )
+
+
+def _cli_binaries(agents: list[str], registry: Optional[dict]) -> set[str]:
+    """Binaries the given cli: agents will spawn, for a scoped --allow-run."""
+    registry = registry or {}
+    bins: set[str] = set()
+    for agent in agents:
+        name = agent[4:].split("?", 1)[0]
+        spec = registry.get(name)
+        command = spec.get("command") if isinstance(spec, dict) else None
+        command = command or _CLI_PRESET_BINARIES.get(name)
+        if not command:
+            return set()  # unknown agent -> let the engine raise, grant broadly
+        bins.add(command)
+    return bins
+
+
+def _check_deno():
+    if shutil.which("deno") is None:
+        raise RuntimeError(
+            "Deno is required but not found on PATH.\n"
+            "Install it on (Mac/Linux): curl -fsSL https://deno.land/install.sh | sh\n"
+            "Install it on (Windows): npm install -g deno\n"
+            "Visit: https://docs.deno.com/runtime/getting_started/installation/ for more installation options"
+        )
+
+def _deno_prefix_cmd() -> list[str]:
+    """Return a subprocess-safe Deno command prefix across platforms."""
+    deno = shutil.which("deno")
+    if deno is None:
+        raise RuntimeError("Deno is required but not found on PATH.")
+
+    # npm installs on Windows often expose deno as a .cmd shim.
+    # Python's subprocess can fail on that directly, so route via cmd.exe.
+    if os.name == "nt" and deno.lower().endswith(".cmd"):
+        return ["cmd", "/c", deno]
+    return [deno]
+
+
+def _extract_tool_source(tool: Callable) -> str:
+    if not callable(tool):
+        raise TypeError(
+            f"tools must be callables, got {type(tool).__name__}"
+        )
+    try:
+        src = inspect.getsource(tool)
+    except (OSError, TypeError) as e:
+        raise TypeError(
+            f"Could not extract source for tool {getattr(tool, '__name__', tool)!r}. "
+            f"Tools must be regular Python functions defined in a source file "
+            f"(not lambdas, builtins, or REPL-defined). ({e})"
+        ) from e
+    return textwrap.dedent(src)
+
+
+def _string_path_note(ext: str) -> str:
+    """Note appended to the instruction for raw-text inputs, telling the model
+    what kind of file it is so it can parse it itself (csv/xml/toml/... are all
+    in the REPL's Python 3.13 stdlib; pandas and PyYAML are not)."""
+    label = f"a `.{ext}` file" if ext else "a file"
+    return (
+        f"The input context is the raw text of {label}. pandas is NOT available "
+        f"in the REPL — use the Python standard library to parse it if needed "
+        f"(e.g. `csv` for CSV/TSV, `xml.etree.ElementTree` for XML, `tomllib` for TOML)."
+    )
+
+
+def _load_input_file(path: str):
+    """Load an input file by extension. Returns (value, ext).
+
+    Structured formats are parsed host-side into a Python object:
+      .json            -> dict / list / scalar
+      .jsonl / .ndjson -> list[dict] (one object per line)
+      .yaml / .yml     -> dict / list  (the REPL has no `yaml`, so we parse here)
+
+    Everything else is passed as raw text; the model parses it itself using the
+    extension (returned as `ext`) as the hint. This scales to large files and
+    lets the model slice instead of us dumping a parsed structure.
+    """
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    if ext == "json":
+        with open(path) as f:
+            return json.load(f), ext
+    if ext in ("jsonl", "ndjson"):
+        with open(path) as f:
+            return [json.loads(line) for line in f if line.strip()], ext
+    if ext in ("yaml", "yml"):
+        with open(path) as f:
+            return yaml.safe_load(f), ext
+    with open(path) as f:
+        return f.read(), ext
+
+
+def run(
+    query: "str | dict | list | None" = None,
+    prefix: Optional[str] = None,
+    config: Optional[RLMConfig | dict] = None,
+    verbose: bool = True,
+    output_schema: Optional[Any] = None,
+    tools: Optional[list[Callable]] = None,
+    env_variables: Optional[dict[str, str]] = None,
+    mcp_servers: Optional[dict[str, dict]] = None,
+    llm_kwargs: Optional[dict] = None,
+    vertex: bool = False,
+    instruction: Optional[str] = None,
+    input_file: Optional[str] = None,
+    # Appended at the end so existing positional callers are unaffected.
+    verbosity: Optional["int | str"] = None,
+    on_step: Optional[Callable[[dict], None]] = None,
+    log_dir: Optional[str] = None,
+    session_dir: Optional[str] = None,
+    session_id: Optional[str] = None,
+    add_session_code_to_context: bool = True,
+) -> dict:
+    """Run a fast-rlm query.
+
+    Args:
+        query: The question / context to process. A string, a JSON-serializable
+            dict, or a list — when a dict/list, the agent receives `context` as a
+            real Python object and the initial probe prints its top-level schema.
+            Optional when `input_file` is given (provide exactly one of the two).
+        prefix: Optional log filename prefix.
+        config: RLMConfig object or dict of overrides (e.g. primary_agent, max_depth).
+            `primary_agent` is REQUIRED and has no default — run() raises a
+            ValueError if it is unset. `sub_agent` is optional and falls back to
+            `primary_agent` when omitted.
+        verbose: Legacy toggle for terminal output. Superseded by `verbosity`;
+            kept for back-compat. Ignored when `verbosity` is set. True maps to
+            verbosity "full", False to "silent".
+        verbosity: How much the engine prints to the terminal. One of
+            0/"silent" (nothing), 1/"summary" (final result + global usage only),
+            or 2/"full" (per-step boxes, spinners, chatter — the default). When
+            None, falls back to `verbose`. Does not affect `on_step`, which
+            streams regardless of verbosity.
+        on_step: Optional callback invoked once per step as the run progresses
+            (root and every sub-agent), giving live programmatic visibility
+            without tailing the log file. Each call receives a dict with
+            `event_type` ("code_generated"/"execution_result"/"final_result"),
+            `run_id`, `parent_run_id`, `depth`, and — for step events — `step`,
+            `code`, `output`, `hasError`, `reasoning`, `usage`, `totalUsage`,
+            and `timestamps`. Runs in a background thread; exceptions it raises
+            are caught and warned about rather than aborting the run. This is the
+            same data written to the JSONL log, delivered live.
+        env_variables: Optional dict of string KV pairs injected as
+            `os.environ` entries inside every Pyodide REPL spawned by this
+            run (root and all sub-agents). They are NOT set on the Deno host
+            process and never leak outside Pyodide. Useful for handing API
+            keys / configuration to tools without exposing them to the model.
+        mcp_servers: Optional dict of MCP servers to connect for this run, keyed
+            by name. Each value is either a stdio config
+            ``{"command": str, "args": [str], "env": {str: str}}`` or an HTTP
+            config ``{"url": str, "headers": {str: str}}``. The root agent sees
+            all configured servers and can call their tools inside the REPL via
+            ``await mcp_call(server, tool, **kwargs)``. Sub-agents inherit none
+            by default — grant them per server via ``llm_query(..., mcp=[name])``,
+            or set ``config=RLMConfig(inherit_mcp=True)`` to have every sub-agent
+            inherit the servers its parent can reach.
+            Configuring any stdio server grants the Deno host ``--allow-run``.
+        tools: Optional list of Python callables exposed to the root agent.
+            Each function's source is extracted via `inspect.getsource` and
+            executed inside the agent's Pyodide REPL before initialization.
+            Tools must be self-contained — do internal imports, and do not
+            close over module-level variables. Sub-agents do NOT inherit
+            these tools; the parent agent must explicitly pass them via
+            `llm_query(query, tools=[...])` (or define new ones in its REPL).
+        llm_kwargs: Optional dict of extra parameters spread into every LLM
+            chat-completion call (root + all sub-agents), e.g.
+            ``{"temperature": 0.1, "top_p": 0.9, "seed": 7}``. Passed through
+            untouched to the OpenAI-compatible ``chat.completions.create`` call.
+        output_schema: Optional schema the root agent's FINAL value must satisfy.
+            Accepts a Pydantic model class, a primitive Python type (str/int/
+            float/bool/list/dict), a `pydantic.TypeAdapter`-compatible type, or
+            a raw JSON Schema dict. Validation runs after FINAL is set; on
+            failure the agent receives the schema + errors and may retry within
+            its remaining call budget.
+        instruction: Optional custom directive appended to the end of the system
+            prompt of every agent (root + all sub-agents, plus delegation-
+            confirmation calls). When provided, a section of the form
+            ``Here is the user's instructions - you must follow it closely:\n
+            {instruction}`` is added. When None, nothing is appended.
+        input_file: Optional path to a file used as the query instead of `query`
+            (pass one or the other, not both). Loaded by extension:
+            `.json`/`.yaml`/`.yml` -> dict/list, `.jsonl`/`.ndjson` -> list[dict],
+            anything else -> raw text the model parses itself (the extension is
+            noted in the instruction so it knows the format). When the loaded
+            value is a dict with no ``instruction`` key, `instruction` is injected
+            into it.
+        log_dir: Optional directory for the run's ``.jsonl`` transcript. Defaults
+            to ``<cwd>/logs``. The returned dict's ``log_file`` gives the exact
+            path written, so callers can locate/tail the live transcript.
+        session_dir: Optional directory holding a persistent, resumable session
+            (created if missing). When set, the root agent's picklable REPL
+            variables and REPL-defined functions are saved to
+            ``<session_dir>/state.json`` after every step, and a later run over
+            the same directory restores them and shows the agent the prior
+            queries + code (with comments) so it continues where it left off.
+            Crash-safe: state is written per step, not at the end. Not a 1:1
+            process clone — open handles, generators, and JS proxies are
+            dropped (and reported to the agent). Prefer the ``fast_rlm.Session``
+            wrapper over passing this directly.
+        session_id: Optional name for the session; when set, state lives in
+            ``<session_dir>/<session_id>/state.json`` so several named sessions
+            can share one ``session_dir``. Requires ``session_dir`` (passing
+            ``session_id`` without it raises ``ValueError``).
+        add_session_code_to_context: When resuming a session, include the code
+            the agent ran in earlier queries in its resume preamble (default
+            ``True``). This lets the agent reuse *how* it built things rather
+            than re-deriving them; experiments show it materially speeds up
+            follow-up queries. Set ``False`` to omit it (only the query→FINAL
+            ledger and restored variables are shown) when minimizing prompt
+            size matters more than resume efficiency. No effect without a
+            session.
+
+    Returns:
+        Dict with 'results', 'usage', and 'log_file' (path to the run's
+        ``.jsonl`` transcript, under `log_dir`).
+    """
+    _check_deno()
+    engine_dir = _find_engine_dir()
+
+    verbosity_level = _normalize_verbosity(verbosity, verbose)
+    if on_step is not None and not callable(on_step):
+        raise TypeError("on_step must be a callable taking a single dict argument.")
+
+    # Resolve input_file into the query (so the CLI can be a thin shim). This is
+    # the file-type contract above; raw-text inputs also get an extension note
+    # appended to the instruction so the model knows how to parse them.
+    if input_file is not None:
+        if query is not None:
+            raise ValueError("Pass either `query` or `input_file`, not both.")
+        query, _ext = _load_input_file(input_file)
+        if isinstance(query, dict) and instruction and "instruction" not in query:
+            query["instruction"] = instruction
+        if isinstance(query, str):
+            _note = _string_path_note(_ext)
+            instruction = f"{instruction}\n\n{_note}" if instruction else _note
+    if query is None:
+        raise ValueError("Provide either `query` or `input_file`.")
+
+    # RLMConfig merge + validation (done early, before any temp files are created):
+    # load yaml defaults, overlay user overrides, REQUIRE primary_agent, and default
+    # sub_agent to primary_agent when it is unset.
+    if isinstance(config, RLMConfig):
+        cfg_dict = asdict(config)
+    else:
+        cfg_dict = dict(config) if config else {}
+
+    default_config_path = engine_dir / "rlm_config.yaml"
+    _defaults = {}
+    if default_config_path.exists():
+        with open(default_config_path) as f:
+            _defaults = _apply_profile(yaml.safe_load(f) or {})
+    merged_config = {**_defaults, **cfg_dict}
+    if instruction is not None:
+        merged_config["instruction"] = instruction
+
+    if not merged_config.get("primary_agent"):
+        raise ValueError(
+            "primary_agent is required and has no default. Set it explicitly, e.g. "
+            "run(query, config=RLMConfig(primary_agent='z-ai/glm-5')) or "
+            "config={'primary_agent': '...'}."
+        )
+    if not merged_config.get("sub_agent"):
+        merged_config["sub_agent"] = merged_config["primary_agent"]
+
+    output_file = tempfile.mktemp(suffix=".json")
+    log_dir = log_dir if log_dir is not None else os.path.join(os.getcwd(), "logs")
+
+    cmd = _deno_prefix_cmd() + [
+        "run",
+        "--allow-read",
+        "--allow-env",
+        "--allow-net",
+        "--allow-sys=hostname,osRelease",
+        "--allow-write",
+    ]
+
+    # Subprocess permission is collected across every feature that needs it and
+    # emitted ONCE below. Deno takes the union of repeated --allow-run flags, so
+    # appending a scoped grant next to a blanket one silently widens it back to
+    # allow-all — the scoping has to be decided in one place.
+    _run_bins: set[str] = set()   # binaries to allow
+    _run_any = False              # True -> blanket grant (unknowable binaries)
+
+    # Vertex AI ADC via gcloud CLI needs subprocess permission
+    if vertex:
+        _run_bins.add("gcloud")
+
+    # ACP agents are spawned as child processes (e.g. npx/opencode), so the Deno
+    # host needs --allow-run when either agent is an "acp:" model. ACP is opt-in:
+    # gate here so an uninstalled run fails in Python with the actionable message
+    # instead of a Deno module-resolution stack trace deep inside the engine.
+    _agents = [merged_config.get("primary_agent") or "", merged_config.get("sub_agent") or ""]
+    _acp_agents_used = [a for a in _agents if a.startswith("acp:")]
+    if _acp_agents_used:
+        from fast_rlm._acp_install import require_installed
+
+        require_installed(_acp_agents_used[0])
+        # ACP shells out to npx, which then runs whatever it downloaded — the
+        # set of binaries is not knowable up front.
+        _run_any = True
+
+    # CLI agents spawn the agent's own binary. Unlike ACP (which needs blanket
+    # --allow-run to reach npx and whatever it downloads), the set of binaries
+    # is known up front, so scope the grant to exactly those.
+    _cli_agents_used = [a for a in _agents if a.startswith("cli:")]
+    if _cli_agents_used:
+        _check_cli_model(_cli_agents_used, merged_config.get("cli_agents"))
+        _check_cli_auth(
+            _cli_agents_used,
+            merged_config.get("cli_agents"),
+            bool(merged_config.get("cli_allow_api_key") or merged_config.get("cli_minimal")),
+        )
+        _bins = _cli_binaries(_cli_agents_used, merged_config.get("cli_agents"))
+        if _bins:
+            _run_bins |= _bins
+        else:
+            _run_any = True  # unresolvable name; the engine raises a clear error
+
+    cmd += [
+        "src/subagents.ts",
+        "--log-dir",
+        log_dir,
+        "--output",
+        output_file,
+        "--verbosity",
+        str(verbosity_level),
+        "--input-json",
+    ]
+
+    if prefix:
+        cmd += ["--prefix", prefix]
+
+    resolved_session_dir = resolve_session_dir(session_id, session_dir)
+    if resolved_session_dir is not None:
+        os.makedirs(resolved_session_dir, exist_ok=True)
+        cmd += ["--session-file", os.path.join(os.path.abspath(resolved_session_dir), "state.json")]
+        if not add_session_code_to_context:
+            cmd.append("--no-session-code")
+
+    # NDJSON step stream for the on_step callback; tailed live below.
+    events_tmpfile = None
+    if on_step is not None:
+        events_tmpfile = tempfile.mktemp(suffix=".events.jsonl")
+        cmd += ["--events-file", events_tmpfile]
+
+    if not isinstance(query, (str, dict, list)):
+        raise TypeError(
+            f"query must be a str, dict, or list, got {type(query).__name__}"
+        )
+    stdin_payload = json.dumps(query)
+
+    env_tmpfile = None
+    if env_variables:
+        if not isinstance(env_variables, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env_variables.items()
+        ):
+            raise TypeError("env_variables must be a dict[str, str]")
+        env_tmpfile = tempfile.mktemp(suffix=".env.json")
+        with open(env_tmpfile, "w") as f:
+            json.dump(env_variables, f)
+        cmd += ["--env-file", env_tmpfile]
+
+    tools_tmpfile = None
+    if tools:
+        tool_sources = [_extract_tool_source(t) for t in tools]
+        tools_tmpfile = tempfile.mktemp(suffix=".tools.json")
+        with open(tools_tmpfile, "w") as f:
+            json.dump(tool_sources, f)
+        cmd += ["--tools-file", tools_tmpfile]
+
+    schema_tmpfile = None
+    if output_schema is not None:
+        schema_dict = _to_json_schema(output_schema)
+        schema_tmpfile = tempfile.mktemp(suffix=".schema.json")
+        with open(schema_tmpfile, "w") as f:
+            json.dump(schema_dict, f)
+        cmd += ["--output-schema-file", schema_tmpfile]
+
+    mcp_tmpfile = None
+    if mcp_servers:
+        if not isinstance(mcp_servers, dict) or not all(
+            isinstance(k, str) and isinstance(v, dict) for k, v in mcp_servers.items()
+        ):
+            raise TypeError("mcp_servers must be a dict[str, dict]")
+        # stdio servers (no 'url') require Deno to spawn subprocesses. Their
+        # commands are known, so scope to them rather than granting everything.
+        _stdio = [cfg for cfg in mcp_servers.values() if "url" not in cfg]
+        if _stdio:
+            _cmds = {c.get("command") for c in _stdio}
+            if all(isinstance(c, str) and c for c in _cmds):
+                _run_bins |= _cmds
+            else:
+                _run_any = True
+        mcp_tmpfile = tempfile.mktemp(suffix=".mcp.json")
+        with open(mcp_tmpfile, "w") as f:
+            json.dump(mcp_servers, f)
+        cmd += ["--mcp-file", mcp_tmpfile]
+
+    llm_kwargs_tmpfile = None
+    if llm_kwargs is not None:
+        if not isinstance(llm_kwargs, dict) or not all(
+            isinstance(k, str) for k in llm_kwargs
+        ):
+            raise TypeError("llm_kwargs must be a dict with string keys")
+        llm_kwargs_tmpfile = tempfile.mktemp(suffix=".llm_kwargs.json")
+        with open(llm_kwargs_tmpfile, "w") as f:
+            json.dump(llm_kwargs, f)
+        cmd += ["--llm-kwargs-file", llm_kwargs_tmpfile]
+
+    # Emit the single subprocess grant now that every feature has declared what
+    # it needs. Deno permission flags must precede the script path, and one
+    # blanket grant anywhere would override every scoped one — hence one flag.
+    if _run_any:
+        cmd.insert(cmd.index("src/subagents.ts"), "--allow-run")
+    elif _run_bins:
+        cmd.insert(
+            cmd.index("src/subagents.ts"),
+            f"--allow-run={','.join(sorted(_run_bins))}",
+        )
+
+    # Write the merged+validated config (always present — primary_agent is required)
+    # to a temp file and hand it to the engine.
+    config_tmpfile = tempfile.mktemp(suffix=".yaml")
+    with open(config_tmpfile, "w") as f:
+        yaml.dump(merged_config, f)
+    cmd += ["--config", config_tmpfile]
+
+    # Vertex AI: signal the Deno engine to use ADC auth
+    run_env = None
+    if vertex:
+        run_env = {**os.environ, "RLM_VERTEX_AI": "1"}
+
+    # At silent verbosity we capture (and drop) the engine's stdio; otherwise we
+    # inherit the terminal and let the engine self-limit via --verbosity.
+    capture_output = verbosity_level < 1
+
+    stop_event = threading.Event()
+    tail_thread = None
+    try:
+        if on_step is not None:
+            tail_thread = threading.Thread(
+                target=_tail_events,
+                args=(events_tmpfile, on_step, stop_event),
+                daemon=True,
+            )
+            tail_thread.start()
+
+        result = subprocess.run(
+            cmd,
+            input=stdin_payload,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(engine_dir),
+            env=run_env,
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE if capture_output else None,
+        )
+
+        if not os.path.exists(output_file):
+            stderr = (result.stderr or "") if capture_output else ""
+            raise RuntimeError(
+                f"fast-rlm engine failed (exit code {result.returncode}).\n{stderr}"
+            )
+
+        with open(output_file) as f:
+            data = json.load(f)
+    finally:
+        # Signal the tail thread to drain remaining events and stop, then join
+        # before the events file is removed below.
+        if tail_thread is not None:
+            stop_event.set()
+            tail_thread.join(timeout=5)
+        if events_tmpfile and os.path.exists(events_tmpfile):
+            os.unlink(events_tmpfile)
+        if os.path.exists(output_file):
+            os.unlink(output_file)
+        if config_tmpfile and os.path.exists(config_tmpfile):
+            os.unlink(config_tmpfile)
+        if schema_tmpfile and os.path.exists(schema_tmpfile):
+            os.unlink(schema_tmpfile)
+        if tools_tmpfile and os.path.exists(tools_tmpfile):
+            os.unlink(tools_tmpfile)
+        if env_tmpfile and os.path.exists(env_tmpfile):
+            os.unlink(env_tmpfile)
+        if mcp_tmpfile and os.path.exists(mcp_tmpfile):
+            os.unlink(mcp_tmpfile)
+        if llm_kwargs_tmpfile and os.path.exists(llm_kwargs_tmpfile):
+            os.unlink(llm_kwargs_tmpfile)
+
+    if "error" in data:
+        raise RuntimeError(f"fast-rlm subagent failed: {data['error']}")
+
+    return data

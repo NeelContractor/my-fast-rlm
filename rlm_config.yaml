@@ -1,0 +1,50 @@
+# ── Presets ─────────────────────────────────────────────────────────────────
+# `profile:` picks the default preset. Override it per run without editing this
+# file by setting the RLM_PROFILE environment variable:
+#   RLM_PROFILE=free     fast-rlm "..."      # OpenRouter free models only
+#   RLM_PROFILE=standard fast-rlm "..."      # paid-capable defaults
+# Top-level keys below are shared by every profile, and a profile's values win.
+profile: free
+
+profiles:
+  # Paid-capable defaults: strong OpenRouter models, normal budgets.
+  standard:
+    primary_agent: "z-ai/glm-5"
+    sub_agent: "minimax/minimax-m2.5"
+    max_calls_per_subagent: 20
+    max_depth: 3
+    max_money_spent: 0.2
+    api_timeout_ms: 30000
+
+  # OpenRouter free models only. `sub_agent` is set explicitly (otherwise it
+  # would copy `primary_agent`), and the budget refuses any paid call. Check
+  # available free models: https://openrouter.ai/models?max_price=0
+  free:
+    primary_agent: "cohere/north-mini-code:free"
+    sub_agent: "nvidia/nemotron-3.5-lightning:free"
+    # Free models are rate-limited, so keep the fan-out small.
+    max_calls_per_subagent: 10
+    max_global_calls: 30
+    max_depth: 2
+    max_money_spent: 0
+    # Free models can be slow.
+    api_timeout_ms: 60000
+
+# ── Shared settings (apply to every profile) ────────────────────────────────
+truncate_len: 10000
+api_max_retries: 3
+# Ablation toggles (default true). Set false to remove the capability from the
+# agent's REPL and strip it from the system prompt (applies to root + sub-agents).
+enable_tools: true
+enable_structured_io: true
+# Capability inheritance for sub-agents (default false). When true, a sub-agent
+# spawned without an explicit tools=/mcp= argument inherits its parent's Python
+# tools / MCP servers and passes them down in turn. An explicit argument on the
+# llm_query call always wins, including an empty list, which grants nothing.
+inherit_tools: false
+inherit_mcp: false
+# Compression guard: force a self-confirm before delegating a large,
+# barely-compressed context to a subagent (ablatable).
+enable_compression_guard: true
+compression_min_chars: 5000
+compression_ratio: 0.6
